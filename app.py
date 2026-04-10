@@ -1,9 +1,12 @@
 """
 ================================================================================
-MUTUAL FUND SCREENER API - Complete Fixed Version
+MUTUAL FUND SCREENER API - RENDER OPTIMIZED VERSION
 ================================================================================
-Run: python mutual_fund_api.py
-API URL: http://localhost:5000/api/health
+FIXES:
+  ✅ AMFI data loads in background (doesn't block startup)
+  ✅ Fallback data if AMFI fails
+  ✅ Shorter timeouts for Render free tier
+  ✅ Health check shows loading status
 ================================================================================
 """
 
@@ -15,6 +18,7 @@ from flask_cors import CORS
 from datetime import datetime
 import time
 import threading
+import os
 
 # ============================================================================
 # CONFIGURATION
@@ -85,21 +89,31 @@ TRUSTED_AMCS = [
 app = Flask(__name__)
 CORS(app)
 
-# Global cache
+# Global state
 amfi_data = None
 benchmark_cache = {}
+amfi_loading = False
+amfi_load_error = None
 last_amfi_refresh = None
 
 # ============================================================================
-# AMFI DATA FUNCTIONS
+# AMFI DATA FUNCTIONS WITH BACKGROUND LOADING
 # ============================================================================
+
 def download_amfi_active_funds():
-    """Download AMFI active fund list"""
+    """Download AMFI active fund list with timeout"""
     print("📥 Downloading AMFI active fund list...")
     url = "https://www.amfiindia.com/spages/NAVAll.txt"
+    
     try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        # Shorter timeout for Render (15 seconds)
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.encoding = "utf-8"
+        
+        if resp.status_code != 200:
+            print(f"  ⚠️ AMFI returned status {resp.status_code}")
+            return None
+        
         records, current_amc = [], ""
         
         for line in resp.text.splitlines():
@@ -123,6 +137,7 @@ def download_amfi_active_funds():
                 continue
         
         df = pd.DataFrame(records)
+        print(f"  📊 Total funds downloaded: {len(df)}")
         
         # Filter segregated portfolios
         exclude_patterns = ["SEGREGATED", "SIDE POCKET", "MATURITY", "CLOSED", "FIXED TERM", "FMP"]
@@ -138,30 +153,97 @@ def download_amfi_active_funds():
         )
         direct = df[mask].reset_index(drop=True)
         print(f"  ✅ Active Direct Growth funds: {len(direct)}")
-        return direct
+        
+        return direct if not direct.empty else None
+        
+    except requests.Timeout:
+        print("  ⚠️ AMFI download TIMEOUT after 15 seconds")
+        return None
     except Exception as e:
         print(f"  ⚠️ AMFI error: {e}")
-        return pd.DataFrame()
+        return None
+
+def create_fallback_data():
+    """Create fallback fund data when AMFI fails"""
+    print("📦 Creating fallback fund data for Render...")
+    
+    # Pre-populated fund data from your working logs
+    fallback_funds = [
+        {"code": "119551", "name": "Aditya Birla Sun Life Banking & PSU Debt Fund - Direct - Growth", "nav": 104.52, "amc": "ADITYA BIRLA"},
+        {"code": "119556", "name": "Aditya Birla Sun Life Small Cap Fund - Direct - Growth", "nav": 42.50, "amc": "ADITYA BIRLA"},
+        {"code": "125354", "name": "Axis Small Cap Fund - Direct Plan - Growth", "nav": 38.20, "amc": "AXIS"},
+        {"code": "119212", "name": "DSP Small Cap Fund - Direct Plan - Growth", "nav": 44.70, "amc": "DSP"},
+        {"code": "119648", "name": "Aditya Birla Sun Life Nifty 50 Index Fund - Direct - Growth", "nav": 35.80, "amc": "ADITYA BIRLA"},
+        {"code": "149373", "name": "Axis Nifty 50 Index Fund - Direct Plan - Growth", "nav": 28.87, "amc": "AXIS"},
+        {"code": "146376", "name": "DSP Nifty 50 Index Fund - Direct Plan - Growth", "nav": 32.15, "amc": "DSP"},
+        {"code": "118482", "name": "BANDHAN Nifty 50 Index Fund - Direct Plan - Growth", "nav": 31.20, "amc": "BANDHAN"},
+        {"code": "151165", "name": "360 ONE ELSS Tax Saver Nifty 50 Index Fund - Direct", "nav": 29.45, "amc": "360 ONE"},
+        {"code": "151471", "name": "NAVI ELSS TAX SAVER NIFTY 50 INDEX FUND - DIRECT", "nav": 27.90, "amc": "NAVI"},
+        {"code": "153529", "name": "ANGEL ONE NIFTY 50 INDEX FUND - DIRECT - GROWTH", "nav": 26.75, "amc": "ANGEL ONE"},
+        {"code": "153506", "name": "Bajaj Finserv Nifty 50 Index Fund - Direct - Growth", "nav": 30.15, "amc": "BAJAJ FINSERV"},
+        {"code": "152329", "name": "Baroda BNP Paribas Nifty 50 Index Fund - Direct Plan", "nav": 28.50, "amc": "BARODA BNP"},
+    ]
+    
+    return pd.DataFrame(fallback_funds)
+
+def refresh_amfi_data_background():
+    """Refresh AMFI data in background thread (non-blocking)"""
+    global amfi_data, amfi_loading, amfi_load_error, last_amfi_refresh
+    
+    if amfi_loading:
+        print("⏳ AMFI already loading in background...")
+        return
+    
+    amfi_loading = True
+    print("🔄 Starting AMFI data download in background...")
+    
+    def _load():
+        global amfi_data, amfi_loading, amfi_load_error, last_amfi_refresh
+        try:
+            data = download_amfi_active_funds()
+            if data is not None and not data.empty:
+                amfi_data = data
+                amfi_load_error = None
+                print(f"✅ AMFI data loaded successfully: {len(amfi_data)} funds")
+            else:
+                amfi_data = create_fallback_data()
+                amfi_load_error = "Using fallback data (AMFI timeout/error)"
+                print(f"⚠️ {amfi_load_error}")
+        except Exception as e:
+            amfi_data = create_fallback_data()
+            amfi_load_error = f"Error: {str(e)}"
+            print(f"❌ {amfi_load_error}")
+        finally:
+            amfi_loading = False
+            last_amfi_refresh = datetime.now()
+    
+    # Run in background thread
+    thread = threading.Thread(target=_load, daemon=True)
+    thread.start()
 
 def search_amfi(amfi_df, keywords):
     """Search AMFI data by keywords"""
     if amfi_df is None or amfi_df.empty:
         return pd.DataFrame()
+    
     mask = pd.Series([False] * len(amfi_df))
     for kw in keywords:
         mask = mask | amfi_df["name"].str.lower().str.contains(kw.lower(), na=False)
+    
     result = amfi_df[mask].copy()
     result["trusted"] = result["name"].str.upper().apply(
-        lambda x: any(a in x for a in TRUSTED_AMCS))
+        lambda x: any(amc in x for amc in TRUSTED_AMCS))
+    
     return result.reset_index(drop=True)
 
 # ============================================================================
 # NAV AND METRICS FUNCTIONS
 # ============================================================================
+
 def fetch_nav_series(scheme_code):
-    """Fetch NAV history from MFapi"""
+    """Fetch NAV history from MFapi with shorter timeout"""
     try:
-        resp = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=12)
+        resp = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=10)
         if resp.status_code != 200:
             return None, None
         data = resp.json()
@@ -272,7 +354,6 @@ def compute_metrics(nav_series, bench_series, scheme_name, is_index):
 
     return {
         "name": scheme_name[:55],
-        "code": scheme_name[:20],  # Placeholder
         "nav": round(cur, 2),
         "ret_1y": r1y,
         "cagr_3y": cagr_3y,
@@ -290,7 +371,7 @@ def compute_metrics(nav_series, bench_series, scheme_name, is_index):
 def score_fund_peer_ranked(m, is_index, trusted, category_metrics):
     """Score fund relative to category peers"""
     if not m or not category_metrics:
-        return 0, []
+        return 50, []
 
     score = 0
 
@@ -341,6 +422,7 @@ def score_fund_peer_ranked(m, is_index, trusted, category_metrics):
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
 def get_benchmark_series(bench_key):
     """Get benchmark NAV series with caching"""
     if bench_key in benchmark_cache:
@@ -386,23 +468,18 @@ def get_category_type(category_name):
         return "international"
     return "others"
 
-def refresh_amfi_data():
-    """Refresh AMFI data"""
-    global amfi_data, last_amfi_refresh
-    print("🔄 Refreshing AMFI data...")
-    amfi_data = download_amfi_active_funds()
-    last_amfi_refresh = datetime.now()
-    print(f"✅ AMFI data refreshed: {len(amfi_data) if amfi_data is not None else 0} funds")
-
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
+    """Health check with loading status"""
     return jsonify({
         "status": "healthy",
         "amfi_funds": len(amfi_data) if amfi_data is not None else 0,
+        "amfi_loading": amfi_loading,
+        "amfi_error": amfi_load_error,
         "benchmarks_cached": len(benchmark_cache),
         "timestamp": datetime.now().isoformat()
     })
@@ -414,7 +491,7 @@ def get_categories():
     
     for cat_name, cat_config in CATEGORIES.items():
         fund_count = 0
-        if amfi_data is not None:
+        if amfi_data is not None and not amfi_data.empty:
             matched = search_amfi(amfi_data, cat_config["keywords"])
             fund_count = len(matched)
         
@@ -444,17 +521,31 @@ def get_funds_by_category(category):
     
     bench_series = get_benchmark_series(bench_key)
     
+    # If AMFI data not loaded yet, return loading status
     if amfi_data is None:
-        return jsonify({"error": "AMFI data not loaded"}), 503
+        return jsonify({
+            "category": category,
+            "benchmark": get_benchmark_name(bench_key),
+            "loading": True,
+            "message": "AMFI data is loading. Please try again in a few seconds.",
+            "funds": []
+        }), 202  # 202 Accepted - still loading
+    
+    if amfi_data.empty:
+        return jsonify({
+            "category": category,
+            "benchmark": get_benchmark_name(bench_key),
+            "funds": []
+        })
     
     matched = search_amfi(amfi_data, keywords)
     
     if matched.empty:
         return jsonify({"category": category, "benchmark": get_benchmark_name(bench_key), "funds": []})
     
-    # Calculate metrics
+    # Calculate metrics (limit to 15 for faster response on Render)
     all_metrics = []
-    for _, row in matched.head(30).iterrows():
+    for _, row in matched.head(15).iterrows():
         nav_series, _ = fetch_nav_series(row["code"])
         if nav_series is None:
             continue
@@ -465,7 +556,7 @@ def get_funds_by_category(category):
             m["trusted"] = bool(row.get("trusted", False))
             all_metrics.append(m)
         
-        time.sleep(0.1)
+        time.sleep(0.05)  # Shorter delay
     
     # Score funds
     scored_funds = []
@@ -515,7 +606,7 @@ def get_fund_details(scheme_code):
     
     # Get fund name
     fund_name = scheme_code
-    if amfi_data is not None:
+    if amfi_data is not None and not amfi_data.empty:
         fund_row = amfi_data[amfi_data["code"] == scheme_code]
         if not fund_row.empty:
             fund_name = fund_row.iloc[0]["name"]
@@ -553,7 +644,7 @@ def compare_funds():
             metrics = compute_metrics(nav_series, None, code, False)
             
             fund_name = code
-            if amfi_data is not None:
+            if amfi_data is not None and not amfi_data.empty:
                 fund_row = amfi_data[amfi_data["code"] == code]
                 if not fund_row.empty:
                     fund_name = fund_row.iloc[0]["name"]
@@ -570,7 +661,7 @@ def compare_funds():
                 "max_dd": metrics.get("max_dd") if metrics else None,
             })
         
-        time.sleep(0.1)
+        time.sleep(0.05)
     
     return jsonify({"comparison": comparison})
 
@@ -581,8 +672,8 @@ def search_funds():
     if len(query) < 3:
         return jsonify({"funds": []})
     
-    if amfi_data is None:
-        return jsonify({"error": "AMFI data not loaded"}), 503
+    if amfi_data is None or amfi_data.empty:
+        return jsonify({"funds": []})
     
     matched = amfi_data[amfi_data["name"].str.lower().str.contains(query, na=False)]
     matched = matched.head(20)
@@ -602,15 +693,18 @@ def get_top_funds():
     """Get top 10 funds across all categories"""
     limit = request.args.get('limit', 10, type=int)
     
+    if amfi_data is None or amfi_data.empty:
+        return jsonify({"funds": []})
+    
     top_funds = []
-    categories_processed = list(CATEGORIES.keys())[:15]
+    categories_processed = list(CATEGORIES.keys())[:10]
     
     for cat_name in categories_processed:
         try:
             response = get_funds_by_category(cat_name)
             if response and hasattr(response, 'json'):
                 data = response.json
-                if data and data.get('funds'):
+                if data and data.get('funds') and len(data['funds']) > 0:
                     top_funds.append(data['funds'][0])
         except Exception:
             continue
@@ -621,10 +715,14 @@ def get_top_funds():
 @app.route('/api/refresh', methods=['POST'])
 def refresh_data():
     """Force refresh AMFI data"""
-    refresh_amfi_data()
+    global amfi_data, benchmark_cache, amfi_load_error
+    amfi_data = None
+    benchmark_cache = {}
+    amfi_load_error = None
+    refresh_amfi_data_background()
     return jsonify({
-        "status": "refreshed",
-        "funds": len(amfi_data) if amfi_data is not None else 0
+        "status": "refreshing",
+        "message": "AMFI data refresh started in background"
     })
 
 # ============================================================================
@@ -632,7 +730,7 @@ def refresh_data():
 # ============================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  🇮🇳  MUTUAL FUND SCREENER API SERVER")
+    print("  🇮🇳  MUTUAL FUND SCREENER API SERVER (RENDER OPTIMIZED)")
     print("=" * 60)
     print(f"  Started: {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
     print("  Endpoints:")
@@ -644,11 +742,14 @@ if __name__ == "__main__":
     print("    GET  /api/search?q=")
     print("    GET  /api/top-funds")
     print("=" * 60)
-    print("  Loading AMFI data...")
+    print("  Loading AMFI data in background (non-blocking)...")
     
-    refresh_amfi_data()
+    # Start background loading (server starts immediately)
+    refresh_amfi_data_background()
     
     print("\n  🚀 Server running at http://localhost:5000")
     print("  Press Ctrl+C to stop\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    # For Render, use 0.0.0.0 and port from environment
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
