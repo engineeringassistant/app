@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mutual-fund-api
+    runtime: python
+    repo: https://github.com/YOUR_USERNAME/mutual-fund-api
+    branch: main
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --only-binary :all: pandas numpy
+      pip install -r requirements.txt
+    startCommand: gunicorn lightweight_api:app --timeout 120 --workers 1
+    envVars:
+      - key: PIP_NO_CACHE_DIR
+        value: "1"
