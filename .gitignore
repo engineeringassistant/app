@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Precomputed data (optional - keep structure but not content)
+precomputed_data/*.json
+precomputed_data/*.pkl
+!precomputed_data/.gitkeep
+
+# Logs
+*.log
